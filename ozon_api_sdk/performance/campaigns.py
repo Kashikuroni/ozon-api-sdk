@@ -141,10 +141,14 @@ class CampaignsAPI:
         poll_interval: float = 10.0,
         on_progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
-        """Request statistics report, poll for completion, and return data.
+        """Request statistics report, poll for completion, and return CSV data.
 
         Performance API report generation is asynchronous - this method handles
         the full lifecycle: request → poll → download.
+
+        Note: Ozon API returns reports in different formats:
+            - CSV text (if single campaign in list)
+            - ZIP archive (if multiple campaigns in list)
 
         Args:
             campaign_ids: List of campaign IDs (max 10).
@@ -157,22 +161,36 @@ class CampaignsAPI:
                         Use this to track progress, log status, or update UI.
 
         Returns:
-            Statistics report data.
+            Dict with keys:
+                - "content": Raw bytes (CSV text or ZIP binary)
+                - "content_type": Content-Type header (e.g., "text/csv", "application/zip")
+                - "format": Either "csv" or "zip"
+                - "text": Decoded CSV text (None for ZIP format)
 
         Raises:
             ValueError: If campaign_ids > 10 or report generation fails.
             TimeoutError: If report not ready after max_attempts.
 
         Example:
-            def progress_handler(progress: ReportPollingProgress):
-                print(f"Polling: {progress}")  # or log, update progress bar, etc.
-
             report = await client.campaigns.get_statistics_report(
                 campaign_ids=["123"],
                 date_from=datetime(2024, 1, 1),
                 date_to=datetime(2024, 1, 31),
-                on_progress=progress_handler,
             )
+
+            if report["format"] == "csv":
+                # Single campaign - CSV text
+                csv_content = report["text"]
+                print(csv_content)
+            else:
+                # Multiple campaigns - ZIP archive
+                import zipfile
+                import io
+
+                with zipfile.ZipFile(io.BytesIO(report["content"])) as zf:
+                    for filename in zf.namelist():
+                        csv_data = zf.read(filename).decode("utf-8")
+                        print(f"Campaign {filename}: {csv_data}")
         """
         if len(campaign_ids) > 10:
             raise ValueError(f"campaign_ids > 10. Got {len(campaign_ids)}")
@@ -241,11 +259,44 @@ class CampaignsAPI:
         return response.get("state")
 
     async def _download_report(self, report_uuid: str) -> dict[str, Any]:
-        """Download completed report."""
-        return await self._client.get(
+        """Download completed report (CSV or ZIP format).
+
+        Performance API returns different formats based on campaign count:
+        - CSV text if single campaign
+        - ZIP archive if multiple campaigns
+
+        Returns:
+            Dict with keys:
+                - "content": Raw bytes content (CSV text or ZIP binary)
+                - "content_type": Response content-type header
+                - "format": Either "csv" or "zip"
+                - "text": Decoded text (only for CSV format)
+        """
+        response = await self._client._request_raw(
+            "GET",
             PerformanceEndpoints.STATISTICS_REPORT,
             params={"UUID": report_uuid},
         )
+
+        content_type = response.headers.get("content-type", "").lower()
+
+        # Определяем формат по content-type
+        if "zip" in content_type or "application/zip" in content_type:
+            # ZIP архив - возвращаем бинарные данные
+            return {
+                "content": response.content,
+                "content_type": response.headers.get("content-type"),
+                "format": "zip",
+                "text": None,
+            }
+        else:
+            # CSV текст - возвращаем и bytes и декодированный текст
+            return {
+                "content": response.content,
+                "content_type": response.headers.get("content-type"),
+                "format": "csv",
+                "text": response.text,
+            }
 
     @staticmethod
     def _datetime_to_start_of_day_iso(dt: datetime) -> str:
